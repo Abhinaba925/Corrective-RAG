@@ -28,6 +28,38 @@ You need active accounts and API keys for:
 - Pinecone
 
 ## Installation
+Create and activate a virtual environment:
+
+Bash
+python -m venv venv
+source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+Install the required dependencies:
+
+Bash
+pip install -r requirements.txt
+Configure environment variables. Copy the example environment file and add your keys:
+
+Bash
+cp .env.example .env
+Usage
+Place the PDF you wish to analyze (e.g., RBI_Annual_Report.pdf) into the data/ directory.
+
+Open the Jupyter Notebook notebooks/Corrective_RAG.ipynb.
+
+If running for the first time, uncomment the ingestion lines in the execution block to parse, chunk, and embed your PDF into Pinecone.
+
+Execute the notebook to initialize the LangGraph pipeline and pass your query.
+
+State Management
+The Advanced CRAG pipeline maintains state via the AdvancedRAGState TypedDict, which tracks:
+
+original_query: The user's initial input.
+
+current_query: The active search string (can be mutated by the rewrite node).
+
+context: The filtered and reranked LangChain documents.
+
+retry_count: Prevents infinite routing loops.
 
 1. Clone the repository:
 ```bash
