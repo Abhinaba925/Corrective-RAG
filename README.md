@@ -1,4 +1,4 @@
-# Corrective RAG Streamlit App
+# Corrective RAG App
 
 This project turns the original Corrective RAG notebook into a deployable
 Streamlit app. It indexes PDFs into Pinecone and answers questions with either
