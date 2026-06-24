@@ -300,7 +300,7 @@ with st.sidebar:
         enable_query_rewrite = st.checkbox("Rewrite weak queries", value=True)
         relevance_threshold_enabled = st.checkbox("Use score threshold", value=False)
         relevance_threshold = st.slider("Score threshold", -10.0, 10.0, 0.0, 0.25)
-        use_fallback = st.checkbox("Fallback provider on rate limit", value=True)
+        use_fallback = st.checkbox("Fallback provider on rate limit", value=False)
 
     params = build_params(
         standard_top_k=int(standard_top_k),

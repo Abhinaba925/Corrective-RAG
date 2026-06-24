@@ -39,7 +39,7 @@ class RAGParams:
     relevance_threshold: float | None = None
     enable_reranking: bool = True
     enable_query_rewrite: bool = True
-    use_fallback: bool = True
+    use_fallback: bool = False
 
 
 @dataclass
@@ -688,9 +688,16 @@ class RAGService:
             if not params.use_fallback or not fallback_provider or not _is_rate_limit_error(exc):
                 raise
 
-            result = self._ask_with_provider(
-                query, mode, vector_store, params, fallback_provider
-            )
+            try:
+                result = self._ask_with_provider(
+                    query, mode, vector_store, params, fallback_provider
+                )
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Primary provider '{provider}' failed: {exc}\n\n"
+                    f"Fallback provider '{fallback_provider}' also failed: {fallback_exc}"
+                ) from fallback_exc
+
             result.metrics["fallback_used"] = True
             result.metrics["fallback_reason"] = str(exc)
             return result

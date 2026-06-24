@@ -19,8 +19,8 @@ Standard RAG or Advanced Corrective RAG.
   - **Advanced CRAG**: rewrite the query, retrieve broadly, rerank context,
     grade relevance, retry when needed, then answer.
   - **Standard RAG**: retrieve context and generate an answer.
-- Fall back to the alternate provider when the active provider rate-limits and
-  the alternate API key is configured.
+- Optionally fall back to the alternate provider when the active provider
+  rate-limits and the alternate API key is configured.
 - Deploy directly on Streamlit Community Cloud from GitHub.
 
 ## Stack
