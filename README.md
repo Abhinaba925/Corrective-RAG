@@ -18,7 +18,7 @@ Standard RAG or Advanced Corrective RAG.
 
 - **UI**: Streamlit
 - **Workflow**: LangGraph
-- **LLM**: Google Gemini via `langchain-google-genai`
+- **LLM**: Groq-hosted Qwen by default, or Google Gemini
 - **Vector DB**: Pinecone Serverless
 - **Embeddings**: `BAAI/bge-base-en-v1.5`
 - **Reranker**: `cross-encoder/ms-marco-MiniLM-L-6-v2`
@@ -47,11 +47,15 @@ For Streamlit Community Cloud, add these in **App settings -> Secrets**:
 
 ```toml
 GOOGLE_API_KEY = "your-google-ai-studio-key"
+GROQ_API_KEY = "your-groq-key"
 PINECONE_API_KEY = "your-pinecone-key"
 PINECONE_INDEX_NAME = "rag-index"
 PINECONE_CLOUD = "aws"
 PINECONE_REGION = "us-east-1"
+LLM_PROVIDER = "groq"
 GEMINI_MODEL = "gemini-2.5-flash"
+GROQ_MODEL = "qwen/qwen3-32b"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
 EMBEDDING_DIMENSION = "768"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -61,6 +65,9 @@ MAX_RETRIES = "2"
 The default embedding model uses 768-dimensional vectors, so keep
 `EMBEDDING_DIMENSION=768` unless you change the embedding model too. The app
 creates the Pinecone index automatically if it does not exist.
+
+Set `LLM_PROVIDER = "groq"` to use Groq. Set `LLM_PROVIDER = "gemini"` to use
+Gemini again.
 
 ## Run Locally With Streamlit
 

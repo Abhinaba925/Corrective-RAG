@@ -28,9 +28,10 @@ async function loadHealth() {
     const data = await parseJson(response);
     indexNameEl.textContent = data.index_name;
     if (data.configured) {
-      setStatus("Configured", "ready");
+      setStatus(`Configured - ${data.llm_provider}`, "ready");
     } else {
-      setStatus(`Missing ${data.missing_env.join(", ")}`, "missing");
+      const issues = [...data.configuration_errors, ...data.missing_env];
+      setStatus(`Missing ${issues.join(", ")}`, "missing");
     }
   } catch (error) {
     setStatus("Health check failed", "missing");

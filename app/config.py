@@ -24,6 +24,7 @@ def _int_from_env(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Settings:
     google_api_key: str | None
+    groq_api_key: str | None
     pinecone_api_key: str | None
     pinecone_index_name: str
     pinecone_cloud: str
@@ -31,7 +32,10 @@ class Settings:
     embedding_model: str
     embedding_dimension: int
     reranker_model: str
+    llm_provider: str
     gemini_model: str
+    groq_model: str
+    groq_base_url: str
     max_retries: int
     upload_dir: Path
 
@@ -39,6 +43,7 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             google_api_key=os.getenv("GOOGLE_API_KEY"),
+            groq_api_key=os.getenv("GROQ_API_KEY"),
             pinecone_api_key=os.getenv("PINECONE_API_KEY"),
             pinecone_index_name=os.getenv("PINECONE_INDEX_NAME", "rag-index"),
             pinecone_cloud=os.getenv("PINECONE_CLOUD", "aws"),
@@ -48,7 +53,12 @@ class Settings:
             reranker_model=os.getenv(
                 "RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"
             ),
+            llm_provider=os.getenv("LLM_PROVIDER", "gemini").strip().lower(),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            groq_model=os.getenv("GROQ_MODEL", "qwen/qwen3-32b"),
+            groq_base_url=os.getenv(
+                "GROQ_BASE_URL", "https://api.groq.com/openai/v1"
+            ).rstrip("/"),
             max_retries=_int_from_env("MAX_RETRIES", 2),
             upload_dir=Path(os.getenv("UPLOAD_DIR", "/tmp/corrective-rag/uploads")),
         )
@@ -56,15 +66,30 @@ class Settings:
     @property
     def missing_env(self) -> list[str]:
         missing = []
-        if not self.google_api_key:
-            missing.append("GOOGLE_API_KEY")
         if not self.pinecone_api_key:
             missing.append("PINECONE_API_KEY")
+        if self.llm_provider == "gemini" and not self.google_api_key:
+            missing.append("GOOGLE_API_KEY")
+        if self.llm_provider == "groq" and not self.groq_api_key:
+            missing.append("GROQ_API_KEY")
         return missing
 
     @property
+    def configuration_errors(self) -> list[str]:
+        errors = []
+        if self.llm_provider not in {"gemini", "groq"}:
+            errors.append("LLM_PROVIDER must be either 'gemini' or 'groq'.")
+        return errors
+
+    @property
     def configured(self) -> bool:
-        return not self.missing_env
+        return not self.missing_env and not self.configuration_errors
+
+    @property
+    def active_llm_model(self) -> str:
+        if self.llm_provider == "groq":
+            return self.groq_model
+        return self.gemini_model
 
 
 @lru_cache(maxsize=1)

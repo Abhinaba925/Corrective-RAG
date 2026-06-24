@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,8 +16,9 @@ from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
 from pinecone import Pinecone, ServerlessSpec
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
+import requests
 from sentence_transformers import CrossEncoder
 from typing_extensions import TypedDict
 
@@ -61,7 +64,106 @@ class IngestResult:
     index_name: str
 
 
+@dataclass
+class ChatResponse:
+    content: str
+
+
+class GroqChatModel:
+    """Small OpenAI-compatible Groq adapter for the calls used in this app."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        temperature: float = 0,
+        timeout: int = 90,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        self.temperature = temperature
+        self.timeout = timeout
+
+    def invoke(self, prompt: str) -> ChatResponse:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Answer directly and do not include hidden reasoning, "
+                        "chain-of-thought, or <think> blocks."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.temperature,
+        }
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            suffix = f" Retry after {retry_after}s." if retry_after else ""
+            raise RuntimeError(f"Groq rate limit exceeded.{suffix}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"Groq API error {response.status_code}: {response.text}")
+
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        return ChatResponse(content=_strip_thinking(content or ""))
+
+    def with_structured_output(self, schema: type[BaseModel]) -> "StructuredGroqChatModel":
+        return StructuredGroqChatModel(self, schema)
+
+
+class StructuredGroqChatModel:
+    def __init__(self, llm: GroqChatModel, schema: type[BaseModel]):
+        self.llm = llm
+        self.schema = schema
+
+    def invoke(self, prompt: str) -> BaseModel:
+        structured_prompt = (
+            "Return only a valid JSON object matching this schema. "
+            "Do not include markdown or extra text.\n"
+            f"Schema fields: {list(self.schema.model_fields.keys())}\n\n"
+            f"{prompt}"
+        )
+        content = self.llm.invoke(structured_prompt).content.strip()
+        try:
+            return self.schema.model_validate_json(content)
+        except ValidationError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if match:
+                try:
+                    return self.schema.model_validate(json.loads(match.group(0)))
+                except (json.JSONDecodeError, ValidationError):
+                    pass
+
+        # The CRAG router only needs a conservative yes/no relevance signal.
+        lowered = content.lower()
+        if "yes" in lowered and "no" not in lowered:
+            return self.schema(binary_score="yes")
+        return self.schema(binary_score="no")
+
+
+def _strip_thinking(content: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
 def _require_config(settings: Settings) -> None:
+    errors = settings.configuration_errors
+    if errors:
+        raise RuntimeError(" ".join(errors))
+
     missing = settings.missing_env
     if missing:
         joined = ", ".join(missing)
@@ -72,6 +174,8 @@ def _install_env(settings: Settings) -> None:
     # LangChain integrations also read these environment variables internally.
     if settings.google_api_key:
         os.environ["GOOGLE_API_KEY"] = settings.google_api_key
+    if settings.groq_api_key:
+        os.environ["GROQ_API_KEY"] = settings.groq_api_key
     if settings.pinecone_api_key:
         os.environ["PINECONE_API_KEY"] = settings.pinecone_api_key
 
@@ -185,7 +289,7 @@ def serialize_sources(documents: list[Document]) -> list[dict[str, Any]]:
 
 
 class StandardRAG:
-    def __init__(self, llm: ChatGoogleGenerativeAI, vector_store: PineconeVectorStore):
+    def __init__(self, llm: Any, vector_store: PineconeVectorStore):
         self.llm = llm
         self.vector_store = vector_store
         self.workflow = self._build_graph()
@@ -232,7 +336,7 @@ class AdvancedRAG:
 
     def __init__(
         self,
-        llm: ChatGoogleGenerativeAI,
+        llm: Any,
         reranker: CrossEncoder,
         vector_store: PineconeVectorStore,
         max_retries: int,
@@ -346,7 +450,7 @@ class RAGService:
         self.settings = settings
         self._lock = Lock()
         self._embeddings: HuggingFaceEmbeddings | None = None
-        self._llm: ChatGoogleGenerativeAI | None = None
+        self._llm: Any | None = None
         self._reranker: CrossEncoder | None = None
         self._index_ready = False
 
@@ -371,14 +475,22 @@ class RAGService:
             return self._embeddings
 
     @property
-    def llm(self) -> ChatGoogleGenerativeAI:
+    def llm(self) -> Any:
         with self._lock:
             if self._llm is None:
-                self._llm = ChatGoogleGenerativeAI(
-                    model=self.settings.gemini_model,
-                    temperature=0,
-                    google_api_key=self.settings.google_api_key,
-                )
+                if self.settings.llm_provider == "groq":
+                    self._llm = GroqChatModel(
+                        api_key=self.settings.groq_api_key or "",
+                        model=self.settings.groq_model,
+                        base_url=self.settings.groq_base_url,
+                        temperature=0,
+                    )
+                else:
+                    self._llm = ChatGoogleGenerativeAI(
+                        model=self.settings.gemini_model,
+                        temperature=0,
+                        google_api_key=self.settings.google_api_key,
+                    )
             return self._llm
 
     @property

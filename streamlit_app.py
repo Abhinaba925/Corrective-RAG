@@ -21,11 +21,15 @@ st.set_page_config(
 
 SECRET_KEYS = (
     "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
     "PINECONE_API_KEY",
     "PINECONE_INDEX_NAME",
     "PINECONE_CLOUD",
     "PINECONE_REGION",
+    "LLM_PROVIDER",
     "GEMINI_MODEL",
+    "GROQ_MODEL",
+    "GROQ_BASE_URL",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSION",
     "RERANKER_MODEL",
@@ -100,9 +104,11 @@ with st.sidebar:
         st.success("Configured")
     else:
         st.error("Missing secrets")
-        st.code("\n".join(settings.missing_env), language="text")
+        messages = settings.configuration_errors + settings.missing_env
+        st.code("\n".join(messages), language="text")
 
     st.caption(f"Pinecone index: {settings.pinecone_index_name}")
+    st.caption(f"LLM provider: {settings.llm_provider}")
     namespace = st.text_input("Namespace", value="", placeholder="default")
     chunk_size = st.number_input(
         "Chunk size", min_value=200, max_value=2000, value=800, step=100
@@ -158,7 +164,8 @@ with left:
     )
 
 with right:
-    st.metric("LLM", settings.gemini_model)
+    st.metric("LLM", settings.active_llm_model)
+    st.metric("Provider", settings.llm_provider)
     st.metric("Embedding dimension", settings.embedding_dimension)
     st.metric("Max retries", settings.max_retries)
 

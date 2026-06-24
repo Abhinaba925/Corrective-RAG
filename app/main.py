@@ -45,7 +45,10 @@ class HealthResponse(BaseModel):
     ok: bool
     configured: bool
     missing_env: list[str]
+    configuration_errors: list[str]
     index_name: str
+    llm_provider: str
+    llm_model: str
     gemini_model: str
     embedding_model: str
     reranker_model: str
@@ -69,7 +72,10 @@ def health() -> HealthResponse:
         ok=True,
         configured=settings.configured,
         missing_env=settings.missing_env,
+        configuration_errors=settings.configuration_errors,
         index_name=settings.pinecone_index_name,
+        llm_provider=settings.llm_provider,
+        llm_model=settings.active_llm_model,
         gemini_model=settings.gemini_model,
         embedding_model=settings.embedding_model,
         reranker_model=settings.reranker_model,
