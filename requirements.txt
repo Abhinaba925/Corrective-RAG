@@ -6,6 +6,7 @@ typing-extensions==4.12.2
 pypdf==5.1.0
 pinecone-client==5.0.1
 langchain-core==0.3.28
+langgraph==0.2.60
 langchain-text-splitters==0.3.4
 langchain-google-genai==2.0.7
 langchain-huggingface==0.1.2

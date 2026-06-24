@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from math import fsum
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from langchain_core.documents import Document
 from langchain_pinecone import PineconeVectorStore
@@ -96,6 +96,18 @@ class IngestResult:
 @dataclass
 class ChatResponse:
     content: str
+
+
+class CRAGState(TypedDict, total=False):
+    original_query: str
+    current_query: str
+    metrics: QueryMetrics
+    final_context: list[Document]
+    accepted_context: bool
+    rewritten_query: str | None
+    retries: int
+    attempt: int
+    answer: str
 
 
 class GroqChatModel:
@@ -475,7 +487,7 @@ class StandardRAG:
 
 
 class AdvancedRAG:
-    """Corrective RAG with query rewriting, reranking, and relevance grading."""
+    """Corrective RAG implemented as a LangGraph control flow."""
 
     def __init__(
         self,
@@ -493,6 +505,36 @@ class AdvancedRAG:
         self.params = params
         self.provider = provider
         self.model = model
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> Any:
+        try:
+            from langgraph.graph import END, StateGraph
+        except ImportError as exc:
+            raise RuntimeError(
+                "LangGraph is required for Advanced CRAG. "
+                "Install dependencies with `pip install -r requirements.txt`."
+            ) from exc
+
+        workflow = StateGraph(CRAGState)
+        workflow.add_node("retrieve_and_rerank", self._graph_retrieve_and_rerank)
+        workflow.add_node("grade_context", self._graph_grade_context)
+        workflow.add_node("rewrite_query", self._graph_rewrite_query)
+        workflow.add_node("generate_answer", self._graph_generate_answer)
+
+        workflow.set_entry_point("retrieve_and_rerank")
+        workflow.add_edge("retrieve_and_rerank", "grade_context")
+        workflow.add_conditional_edges(
+            "grade_context",
+            self._graph_route_after_grading,
+            {
+                "rewrite_query": "rewrite_query",
+                "generate_answer": "generate_answer",
+            },
+        )
+        workflow.add_edge("rewrite_query", "retrieve_and_rerank")
+        workflow.add_edge("generate_answer", END)
+        return workflow.compile()
 
     def _rewrite_query(self, query: str) -> str:
         prompt = (
@@ -571,35 +613,85 @@ class AdvancedRAG:
         )
         return self.llm.invoke(prompt).content
 
+    def _graph_retrieve_and_rerank(self, state: CRAGState) -> CRAGState:
+        metrics = state["metrics"]
+        final_context = self._retrieve_and_rerank(state["current_query"], metrics)
+        metrics.final_docs = len(final_context)
+        return {
+            "metrics": metrics,
+            "final_context": final_context,
+        }
+
+    def _graph_grade_context(self, state: CRAGState) -> CRAGState:
+        metrics = state["metrics"]
+        relevant = self._context_is_relevant(
+            state["current_query"],
+            state.get("final_context", []),
+            metrics,
+        )
+        metrics.accepted_context = relevant
+        return {
+            "metrics": metrics,
+            "accepted_context": relevant,
+        }
+
+    def _graph_route_after_grading(self, state: CRAGState) -> str:
+        if state.get("accepted_context"):
+            return "generate_answer"
+        if state.get("attempt", 0) >= self.params.max_retries:
+            return "generate_answer"
+        if not self.params.enable_query_rewrite:
+            return "generate_answer"
+        return "rewrite_query"
+
+    def _graph_rewrite_query(self, state: CRAGState) -> CRAGState:
+        metrics = state["metrics"]
+        rewrite_start = time.perf_counter()
+        rewritten_query = self._rewrite_query(state["original_query"])
+        metrics.rewrite_ms += _elapsed_ms(rewrite_start)
+        metrics.rewrite_triggered = True
+        return {
+            "current_query": rewritten_query,
+            "rewritten_query": rewritten_query,
+            "retries": state.get("retries", 0) + 1,
+            "attempt": state.get("attempt", 0) + 1,
+            "metrics": metrics,
+        }
+
+    def _graph_generate_answer(self, state: CRAGState) -> CRAGState:
+        metrics = state["metrics"]
+        generation_start = time.perf_counter()
+        answer = self._generate(
+            state["original_query"],
+            state.get("final_context", []),
+        )
+        metrics.generation_ms = _elapsed_ms(generation_start)
+        return {
+            "answer": answer,
+            "metrics": metrics,
+        }
+
     def ask(self, query: str) -> RAGResult:
         metrics = QueryMetrics()
         total_start = time.perf_counter()
-        current_query = query
-        rewritten_query: str | None = None
-        retries = 0
-        final_context: list[Document] = []
 
-        for attempt in range(self.params.max_retries + 1):
-            final_context = self._retrieve_and_rerank(current_query, metrics)
-            metrics.final_docs = len(final_context)
-            relevant = self._context_is_relevant(current_query, final_context, metrics)
-            metrics.accepted_context = relevant
-            if relevant or attempt >= self.params.max_retries:
-                break
+        final_state = self.graph.invoke(
+            {
+                "original_query": query,
+                "current_query": query,
+                "metrics": metrics,
+                "final_context": [],
+                "accepted_context": False,
+                "rewritten_query": None,
+                "retries": 0,
+                "attempt": 0,
+                "answer": "",
+            }
+        )
 
-            if not self.params.enable_query_rewrite:
-                break
-
-            rewrite_start = time.perf_counter()
-            current_query = self._rewrite_query(query)
-            metrics.rewrite_ms += _elapsed_ms(rewrite_start)
-            metrics.rewrite_triggered = True
-            rewritten_query = current_query
-            retries += 1
-
-        generation_start = time.perf_counter()
-        answer = self._generate(query, final_context)
-        metrics.generation_ms = _elapsed_ms(generation_start)
+        metrics = final_state["metrics"]
+        answer = final_state.get("answer", "")
+        final_context = final_state.get("final_context", [])
         metrics.total_ms = _elapsed_ms(total_start)
         metrics.no_answer_detected = _looks_like_no_answer(answer)
 
@@ -611,8 +703,10 @@ class AdvancedRAG:
             model=self.model,
             metrics=asdict(metrics),
             params=asdict(self.params),
-            rewritten_query=rewritten_query or current_query,
-            retries=retries,
+            rewritten_query=final_state.get("rewritten_query") or final_state.get(
+                "current_query", query
+            ),
+            retries=final_state.get("retries", 0),
         )
 
 
