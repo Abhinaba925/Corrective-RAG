@@ -15,6 +15,7 @@ Standard RAG or Advanced Corrective RAG.
   generation.
 - Tune retrieval depth, chunking, retry count, reranking, query rewriting,
   temperature, and relevance thresholds from the sidebar.
+- Visualize the app architecture and CRAG loop in a dedicated Design tab.
 - List and delete Pinecone namespaces from the app.
 - Choose between:
   - **Advanced CRAG**: rewrite the query, retrieve broadly, rerank context,
@@ -109,6 +110,8 @@ Do not commit `.env` or `.streamlit/secrets.toml`.
 
 ## Streamlit Tabs
 
+- **Design**: View system architecture, CRAG control flow, Standard vs CRAG
+  flow, and live configuration.
 - **Ask**: Run one question through Standard RAG or CRAG.
 - **Compare**: Run the same question through both pipelines and compare latency,
   source counts, reranker scores, answer length, source overlap, retry count,

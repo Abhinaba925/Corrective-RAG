@@ -231,6 +231,98 @@ def rows_to_csv(rows: list[dict[str, object]]) -> str:
     return output.getvalue()
 
 
+def render_mermaid(source: str) -> None:
+    st.markdown(f"```mermaid\n{source}\n```")
+
+
+def render_system_design(settings: Settings, params: RAGParams, namespace: str) -> None:
+    st.subheader("System Architecture")
+    render_mermaid(
+        """
+flowchart LR
+    U["User"] --> UI["Streamlit App"]
+    UI --> CFG["Secrets + Sidebar Config"]
+    UI --> PDF["PDF Upload"]
+    PDF --> SPLIT["PyPDF + Text Splitter"]
+    SPLIT --> EMB["BGE Embeddings"]
+    EMB --> PC[("Pinecone Index")]
+    UI --> Q["Question"]
+    Q --> RET["Retriever"]
+    RET --> PC
+    RET --> STD["Standard RAG"]
+    RET --> CRAG["Corrective RAG"]
+    CRAG --> RR["Cross-Encoder Reranker"]
+    CRAG --> GRADE["Relevance Gate"]
+    GRADE --> REWRITE["Query Rewrite"]
+    REWRITE --> RET
+    STD --> LLM["Groq / Gemini LLM"]
+    CRAG --> LLM
+    LLM --> ANS["Grounded Answer + Sources"]
+    ANS --> UI
+        """
+    )
+
+    st.subheader("CRAG Control Loop")
+    render_mermaid(
+        """
+flowchart TD
+    A["Original Question"] --> B{"Rewrite enabled?"}
+    B -->|"yes, first pass or weak context"| C["Optimized Search Query"]
+    B -->|"no"| D["Use Current Query"]
+    C --> E["Broad Retrieval from Pinecone"]
+    D --> E
+    E --> F{"Reranking enabled?"}
+    F -->|"yes"| G["Cross-Encoder Scores"]
+    F -->|"no"| H["Keep Retriever Order"]
+    G --> I["Select Final Context"]
+    H --> I
+    I --> J{"Context accepted?"}
+    J -->|"score threshold passes"| K["Generate Answer"]
+    J -->|"LLM grading enabled + yes"| K
+    J -->|"weak + retries remain"| C
+    J -->|"weak + no retries"| K
+    K --> L["Answer, Sources, Metrics"]
+        """
+    )
+
+    st.subheader("Standard RAG vs CRAG")
+    render_mermaid(
+        """
+flowchart LR
+    Q1["Question"] --> S1["Retrieve top-k"]
+    S1 --> S2["Generate once"]
+    S2 --> S3["Standard Answer"]
+
+    Q2["Question"] --> C1["Broad retrieve"]
+    C1 --> C2["Rerank"]
+    C2 --> C3["Grade / threshold"]
+    C3 --> C4{"Weak context?"}
+    C4 -->|"yes"| C5["Rewrite query"]
+    C5 --> C1
+    C4 -->|"no or retry limit"| C6["Generate"]
+    C6 --> C7["CRAG Answer"]
+        """
+    )
+
+    st.subheader("Live Configuration")
+    config_rows = [
+        {"setting": "Namespace", "value": namespace or "default"},
+        {"setting": "Index", "value": settings.pinecone_index_name},
+        {"setting": "Provider", "value": settings.llm_provider},
+        {"setting": "Model", "value": settings.active_llm_model},
+        {"setting": "Standard top k", "value": params.standard_top_k},
+        {"setting": "CRAG broad k", "value": params.advanced_broad_k},
+        {"setting": "CRAG final docs", "value": params.advanced_final_k},
+        {"setting": "CRAG max retries", "value": params.max_retries},
+        {"setting": "Reranking", "value": params.enable_reranking},
+        {"setting": "Query rewrite", "value": params.enable_query_rewrite},
+        {"setting": "LLM relevance grading", "value": params.enable_llm_grading},
+        {"setting": "Score threshold", "value": params.relevance_threshold},
+        {"setting": "Fallback provider", "value": params.use_fallback},
+    ]
+    st.dataframe(config_rows, hide_index=True, use_container_width=True)
+
+
 def handle_error(exc: Exception) -> None:
     message = str(exc)
     lowered = message.lower()
@@ -389,9 +481,12 @@ with st.sidebar:
         finally:
             temp_path.unlink(missing_ok=True)
 
-ask_tab, compare_tab, evaluate_tab, manage_tab, history_tab = st.tabs(
-    ["Ask", "Compare", "Evaluate", "Manage", "History"]
+design_tab, ask_tab, compare_tab, evaluate_tab, manage_tab, history_tab = st.tabs(
+    ["Design", "Ask", "Compare", "Evaluate", "Manage", "History"]
 )
+
+with design_tab:
+    render_system_design(settings, params, namespace)
 
 with ask_tab:
     mode_label = st.radio(
