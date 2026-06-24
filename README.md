@@ -1,67 +1,133 @@
-# Corrective RAG (CRAG) Pipeline
+# Corrective RAG Cloud App
 
-This repository contains a Retrieval-Augmented Generation (RAG) system with an advanced corrective architecture (CRAG). It leverages LangGraph to create a cyclic workflow that evaluates retrieved documents for relevance, reranks them using a cross-encoder, and rewrites search queries if the initial context is insufficient.
+This project turns the original Corrective RAG notebook into a deployable web app.
+It provides a browser UI and FastAPI backend for indexing PDFs into Pinecone and
+asking questions with either Standard RAG or Advanced Corrective RAG.
 
-## Architecture
+## What It Does
 
-The system provides two pipelines:
-1. **Standard RAG**: A baseline linear pipeline that retrieves chunks via cosine similarity and generates an answer.
-2. **Advanced CRAG**: A stateful workflow utilizing LangGraph. 
-   - **Retrieval & Reranking**: Fetches a broad set of documents from Pinecone and reranks them using `ms-marco-MiniLM-L-6-v2`.
-   - **Grading**: Uses a structured LLM output to perform a binary relevance check on the reranked documents.
-   - **Routing & Rewriting**: If documents are deemed irrelevant, the query is optimized and rewritten, triggering a new search cycle (capped at a maximum retry limit).
-   - **Generation**: Constructs the final response based strictly on validated context.
+- Upload a PDF from the browser and index its chunks in Pinecone.
+- Ask questions against the indexed document set.
+- Choose between:
+  - **Standard RAG**: retrieve context and generate an answer.
+  - **Advanced CRAG**: rewrite the query, retrieve broadly, rerank with a
+    cross-encoder, grade context relevance, retry when needed, then answer.
+- Deploy as a single Docker web service.
 
-## Technology Stack
+## Stack
 
-- **Orchestration**: LangChain, LangGraph
-- **Vector Database**: Pinecone (Serverless)
-- **LLM**: Google Gemini (gemini-2.5-flash)
-- **Embeddings**: HuggingFace (`BAAI/bge-base-en-v1.5`)
-- **Reranker**: Sentence Transformers Cross-Encoder
-- **Document Processing**: PyPDF
+- **API/UI**: FastAPI, vanilla HTML/CSS/JS
+- **Workflow**: LangGraph
+- **LLM**: Google Gemini via `langchain-google-genai`
+- **Vector DB**: Pinecone Serverless
+- **Embeddings**: `BAAI/bge-base-en-v1.5`
+- **Reranker**: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- **PDF parsing**: PyPDF
 
-## Prerequisites
+## Project Structure
 
-You need active accounts and API keys for:
-- Google AI Studio (Gemini)
-- Pinecone
+```text
+app/
+  config.py          Environment configuration
+  rag.py             RAG and CRAG pipeline logic
+  main.py            FastAPI routes
+  static/            Browser UI
+Corrective_RAG.ipynb Original notebook
+Dockerfile           Container build
+render.yaml          Render blueprint
+requirements.txt     Python dependencies
+.env.example         Required environment variables
+```
 
-## Installation
-Create and activate a virtual environment:
+## Required Environment Variables
 
-Bash
-python -m venv venv
-source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-Install the required dependencies:
+Create a `.env` locally or configure these in your cloud provider:
 
-Bash
-pip install -r requirements.txt
-Configure environment variables. Copy the example environment file and add your keys:
-
-Bash
-cp .env.example .env
-Usage
-Place the PDF you wish to analyze (e.g., RBI_Annual_Report.pdf) into the data/ directory.
-
-Open the Jupyter Notebook notebooks/Corrective_RAG.ipynb.
-
-If running for the first time, uncomment the ingestion lines in the execution block to parse, chunk, and embed your PDF into Pinecone.
-
-Execute the notebook to initialize the LangGraph pipeline and pass your query.
-
-State Management
-The Advanced CRAG pipeline maintains state via the AdvancedRAGState TypedDict, which tracks:
-
-original_query: The user's initial input.
-
-current_query: The active search string (can be mutated by the rewrite node).
-
-context: The filtered and reranked LangChain documents.
-
-retry_count: Prevents infinite routing loops.
-
-1. Clone the repository:
 ```bash
-git clone [https://github.com/yourusername/corrective-rag-pipeline.git](https://github.com/yourusername/corrective-rag-pipeline.git)
-cd corrective-rag-pipeline
+GOOGLE_API_KEY=your-google-ai-studio-key
+PINECONE_API_KEY=your-pinecone-key
+PINECONE_INDEX_NAME=rag-index
+PINECONE_CLOUD=aws
+PINECONE_REGION=us-east-1
+GEMINI_MODEL=gemini-2.5-flash
+EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
+EMBEDDING_DIMENSION=768
+RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+MAX_RETRIES=2
+```
+
+The app creates the Pinecone index automatically if it does not exist. The
+default embedding model uses 768-dimensional vectors, so keep
+`EMBEDDING_DIMENSION=768` unless you change the embedding model too.
+
+## Run Locally
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Fill in `.env`, then run:
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
+```
+
+Open `http://localhost:8080`.
+
+## Run With Docker
+
+```bash
+docker build -t corrective-rag .
+docker run --env-file .env -p 8080:8080 corrective-rag
+```
+
+Open `http://localhost:8080`.
+
+## Deploy To Render
+
+1. Push this repository to GitHub.
+2. In Render, create a new **Blueprint** from the repository, or create a new
+   Docker web service manually.
+3. Use the included `render.yaml` if deploying as a Blueprint.
+4. Add `GOOGLE_API_KEY` and `PINECONE_API_KEY` as secret environment variables.
+5. Deploy the service.
+
+The first query or ingestion can take longer because Hugging Face models are
+downloaded on demand. Use a plan with enough memory for `sentence-transformers`
+and the cross-encoder reranker.
+
+## API
+
+Health:
+
+```bash
+curl http://localhost:8080/api/health
+```
+
+Ingest a PDF:
+
+```bash
+curl -X POST http://localhost:8080/api/ingest \
+  -F "file=@/path/to/document.pdf" \
+  -F "namespace=default"
+```
+
+Ask a question:
+
+```bash
+curl -X POST http://localhost:8080/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What are the main observations?","mode":"advanced","namespace":"default"}'
+```
+
+## Notes
+
+- Pinecone namespaces let you keep separate document collections in the same
+  index. Leave namespace blank to use the default namespace.
+- Uploaded PDFs are parsed, embedded, sent to Pinecone, and then removed from
+  the app container.
+- The notebook is still included for reference, but the deployable entry point
+  is `app.main:app`.
