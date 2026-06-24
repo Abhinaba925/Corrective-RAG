@@ -4,7 +4,8 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from math import fsum
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
@@ -48,10 +49,46 @@ class GradeDocuments(BaseModel):
 
 
 @dataclass
+class RAGParams:
+    standard_top_k: int = 15
+    advanced_broad_k: int = 40
+    advanced_final_k: int = 5
+    max_retries: int = 2
+    temperature: float = 0
+    relevance_threshold: float | None = None
+    enable_reranking: bool = True
+    enable_query_rewrite: bool = True
+    use_fallback: bool = True
+
+
+@dataclass
+class QueryMetrics:
+    total_ms: float = 0
+    rewrite_ms: float = 0
+    retrieval_ms: float = 0
+    rerank_ms: float = 0
+    grading_ms: float = 0
+    generation_ms: float = 0
+    retrieved_docs: int = 0
+    final_docs: int = 0
+    top_score: float | None = None
+    avg_score: float | None = None
+    accepted_context: bool = False
+    rewrite_triggered: bool = False
+    no_answer_detected: bool = False
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+
+
+@dataclass
 class RAGResult:
     answer: str
     sources: list[dict[str, Any]]
     mode: str
+    provider: str
+    model: str
+    metrics: dict[str, Any]
+    params: dict[str, Any]
     rewritten_query: str | None = None
     retries: int = 0
 
@@ -244,9 +281,12 @@ def _index_value(description: Any, key: str) -> Any:
     return getattr(description, key, None)
 
 
-def extract_pdf_documents(pdf_path: Path) -> tuple[list[Document], int]:
+def extract_pdf_documents(
+    pdf_path: Path, source_name: str | None = None
+) -> tuple[list[Document], int]:
     reader = PdfReader(str(pdf_path))
     documents: list[Document] = []
+    source = source_name or pdf_path.name
 
     for index, page in enumerate(reader.pages):
         text = page.extract_text() or ""
@@ -254,7 +294,7 @@ def extract_pdf_documents(pdf_path: Path) -> tuple[list[Document], int]:
             documents.append(
                 Document(
                     page_content=text,
-                    metadata={"page": index + 1, "source": pdf_path.name},
+                    metadata={"page": index + 1, "source": source},
                 )
             )
 
@@ -283,51 +323,108 @@ def serialize_sources(documents: list[Document]) -> list[dict[str, Any]]:
                 "source": metadata.get("source"),
                 "score": round(float(score), 4) if score is not None else None,
                 "preview": doc.page_content[:700],
+                "content": doc.page_content,
             }
         )
     return sources
 
 
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _looks_like_no_answer(answer: str) -> bool:
+    lowered = answer.strip().lower()
+    markers = (
+        "context lacks",
+        "context does not",
+        "not provided in the context",
+        "not mentioned in the context",
+        "i don't know",
+        "i do not know",
+        "cannot determine",
+        "missing",
+        "unknown",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _score_summary(documents: list[Document]) -> tuple[float | None, float | None]:
+    scores = [
+        float(doc.metadata["relevance_score"])
+        for doc in documents
+        if doc.metadata.get("relevance_score") is not None
+    ]
+    if not scores:
+        return None, None
+    return round(max(scores), 4), round(fsum(scores) / len(scores), 4)
+
+
+def _validate_params(params: RAGParams) -> RAGParams:
+    params.standard_top_k = max(1, int(params.standard_top_k))
+    params.advanced_broad_k = max(1, int(params.advanced_broad_k))
+    params.advanced_final_k = max(1, min(int(params.advanced_final_k), params.advanced_broad_k))
+    params.max_retries = max(0, int(params.max_retries))
+    params.temperature = min(1.5, max(0, float(params.temperature)))
+    return params
+
+
 class StandardRAG:
-    def __init__(self, llm: Any, vector_store: PineconeVectorStore):
+    def __init__(
+        self,
+        llm: Any,
+        vector_store: PineconeVectorStore,
+        params: RAGParams,
+        provider: str,
+        model: str,
+    ):
         self.llm = llm
         self.vector_store = vector_store
-        self.workflow = self._build_graph()
-
-    def _build_graph(self):
-        def retrieve(state: RAGState) -> dict[str, Any]:
-            retriever = self.vector_store.as_retriever(search_kwargs={"k": 15})
-            return {"context": retriever.invoke(state["query"])}
-
-        def generate(state: RAGState) -> dict[str, Any]:
-            context_str = "\n\n".join(
-                [
-                    f"[Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
-                    for doc in state["context"]
-                ]
-            )
-            prompt = (
-                "Answer the user's question using only the context below. "
-                "If the context lacks the answer, state that it is missing.\n\n"
-                f"Context:\n{context_str}\n\n"
-                f"Question: {state['query']}\nAnswer:"
-            )
-            return {"response": self.llm.invoke(prompt).content}
-
-        graph = StateGraph(RAGState)
-        graph.add_node("retrieve", retrieve)
-        graph.add_node("generate", generate)
-        graph.add_edge(START, "retrieve")
-        graph.add_edge("retrieve", "generate")
-        graph.add_edge("generate", END)
-        return graph.compile()
+        self.params = params
+        self.provider = provider
+        self.model = model
 
     def ask(self, query: str) -> RAGResult:
-        output = self.workflow.invoke({"query": query, "context": [], "response": ""})
+        metrics = QueryMetrics()
+        total_start = time.perf_counter()
+
+        retrieval_start = time.perf_counter()
+        retriever = self.vector_store.as_retriever(
+            search_kwargs={"k": self.params.standard_top_k}
+        )
+        context = retriever.invoke(query)
+        metrics.retrieval_ms = _elapsed_ms(retrieval_start)
+        metrics.retrieved_docs = len(context)
+        metrics.final_docs = len(context)
+
+        context_str = "\n\n".join(
+            [
+                f"[Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
+                for doc in context
+            ]
+        )
+        prompt = (
+            "Answer the user's question using only the context below. "
+            "If the context lacks the answer, state that it is missing.\n\n"
+            f"Context:\n{context_str}\n\n"
+            f"Question: {query}\nAnswer:"
+        )
+
+        generation_start = time.perf_counter()
+        answer = self.llm.invoke(prompt).content
+        metrics.generation_ms = _elapsed_ms(generation_start)
+        metrics.total_ms = _elapsed_ms(total_start)
+        metrics.accepted_context = bool(context)
+        metrics.no_answer_detected = _looks_like_no_answer(answer)
+
         return RAGResult(
-            answer=output["response"],
-            sources=serialize_sources(output["context"]),
+            answer=answer,
+            sources=serialize_sources(context),
             mode="standard",
+            provider=self.provider,
+            model=self.model,
+            metrics=asdict(metrics),
+            params=asdict(self.params),
         )
 
 
@@ -339,109 +436,134 @@ class AdvancedRAG:
         llm: Any,
         reranker: CrossEncoder,
         vector_store: PineconeVectorStore,
-        max_retries: int,
+        params: RAGParams,
+        provider: str,
+        model: str,
     ):
         self.llm = llm
         self.grader_llm = llm.with_structured_output(GradeDocuments)
         self.reranker = reranker
         self.vector_store = vector_store
-        self.max_retries = max_retries
-        self.workflow = self._build_graph()
+        self.params = params
+        self.provider = provider
+        self.model = model
 
-    def _build_graph(self):
-        def rewrite_query(state: AdvancedRAGState) -> dict[str, Any]:
-            prompt = (
-                "Extract keywords and concepts from this question to optimize it "
-                "for vector search. Do not answer it.\n"
-                f"Question: {state['original_query']}\nOptimized:"
-            )
-            rewritten = self.llm.invoke(prompt).content.strip()
-            return {
-                "current_query": rewritten or state["original_query"],
-                "retry_count": state["retry_count"] + 1,
-            }
+    def _rewrite_query(self, query: str) -> str:
+        prompt = (
+            "Extract keywords and concepts from this question to optimize it "
+            "for vector search. Do not answer it.\n"
+            f"Question: {query}\nOptimized:"
+        )
+        rewritten = self.llm.invoke(prompt).content.strip()
+        return rewritten or query
 
-        def retrieve_and_rerank(state: AdvancedRAGState) -> dict[str, Any]:
-            query = state["current_query"] or state["original_query"]
-            broad_docs = self.vector_store.as_retriever(search_kwargs={"k": 40}).invoke(
-                query
-            )
-            if not broad_docs:
-                return {"context": []}
+    def _retrieve_and_rerank(
+        self, query: str, metrics: QueryMetrics
+    ) -> list[Document]:
+        retrieval_start = time.perf_counter()
+        docs = self.vector_store.as_retriever(
+            search_kwargs={"k": self.params.advanced_broad_k}
+        ).invoke(query)
+        metrics.retrieval_ms += _elapsed_ms(retrieval_start)
+        metrics.retrieved_docs += len(docs)
 
-            pairs = [[query, doc.page_content] for doc in broad_docs]
+        if not docs:
+            return []
+
+        if self.params.enable_reranking:
+            rerank_start = time.perf_counter()
+            pairs = [[query, doc.page_content] for doc in docs]
             scores = self.reranker.predict(pairs)
-            for doc, score in zip(broad_docs, scores):
+            for doc, score in zip(docs, scores):
                 doc.metadata["relevance_score"] = float(score)
+            docs.sort(key=lambda item: item.metadata["relevance_score"], reverse=True)
+            metrics.rerank_ms += _elapsed_ms(rerank_start)
 
-            broad_docs.sort(
-                key=lambda item: item.metadata["relevance_score"], reverse=True
-            )
-            return {"context": broad_docs[:5]}
+        return docs[: self.params.advanced_final_k]
 
-        def grade_context(state: AdvancedRAGState) -> dict[str, Any]:
-            return {"context": state["context"]}
+    def _context_is_relevant(
+        self, query: str, context: list[Document], metrics: QueryMetrics
+    ) -> bool:
+        if not context:
+            return False
 
-        def router(state: AdvancedRAGState) -> Literal["generate", "rewrite_query"]:
-            if state["retry_count"] >= self.max_retries:
-                return "generate"
-            if not state["context"]:
-                return "rewrite_query"
+        top_score, avg_score = _score_summary(context)
+        metrics.top_score = top_score
+        metrics.avg_score = avg_score
+        if (
+            self.params.relevance_threshold is not None
+            and top_score is not None
+            and top_score < self.params.relevance_threshold
+        ):
+            return False
 
-            context_str = "\n\n".join([doc.page_content for doc in state["context"]])
-            prompt = (
-                "Does this context relate to the question? "
-                "Return only the structured binary score.\n"
-                f"Q: {state['current_query']}\nContext: {context_str}"
-            )
-            grade = self.grader_llm.invoke(prompt)
-            if grade.binary_score.strip().lower().startswith("yes"):
-                return "generate"
-            return "rewrite_query"
+        context_str = "\n\n".join([doc.page_content for doc in context])
+        prompt = (
+            "Does this context relate to the question? "
+            "Return only the structured binary score.\n"
+            f"Q: {query}\nContext: {context_str}"
+        )
+        grading_start = time.perf_counter()
+        grade = self.grader_llm.invoke(prompt)
+        metrics.grading_ms += _elapsed_ms(grading_start)
+        return grade.binary_score.strip().lower().startswith("yes")
 
-        def generate(state: AdvancedRAGState) -> dict[str, Any]:
-            context_str = "\n\n".join(
-                [
-                    f"[Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
-                    for doc in state["context"]
-                ]
-            )
-            prompt = (
-                "Answer using ONLY the provided context. If unknown, say so.\n\n"
-                f"Question: {state['original_query']}\n\n"
-                f"Context:\n{context_str}\n\nAnswer:"
-            )
-            return {"response": self.llm.invoke(prompt).content}
-
-        graph = StateGraph(AdvancedRAGState)
-        graph.add_node("rewrite_query", rewrite_query)
-        graph.add_node("retrieve_and_rerank", retrieve_and_rerank)
-        graph.add_node("grade_context", grade_context)
-        graph.add_node("generate", generate)
-        graph.add_edge(START, "rewrite_query")
-        graph.add_edge("rewrite_query", "retrieve_and_rerank")
-        graph.add_edge("retrieve_and_rerank", "grade_context")
-        graph.add_conditional_edges("grade_context", router)
-        graph.add_edge("generate", END)
-        return graph.compile()
+    def _generate(self, original_query: str, context: list[Document]) -> str:
+        context_str = "\n\n".join(
+            [
+                f"[Page {doc.metadata.get('page', '?')}]: {doc.page_content}"
+                for doc in context
+            ]
+        )
+        prompt = (
+            "Answer using ONLY the provided context. If unknown, say so.\n\n"
+            f"Question: {original_query}\n\n"
+            f"Context:\n{context_str}\n\nAnswer:"
+        )
+        return self.llm.invoke(prompt).content
 
     def ask(self, query: str) -> RAGResult:
-        output = self.workflow.invoke(
-            {
-                "original_query": query,
-                "current_query": "",
-                "context": [],
-                "response": "",
-                "retry_count": 0,
-            },
-            config={"recursion_limit": self.max_retries * 4 + 8},
-        )
+        metrics = QueryMetrics()
+        total_start = time.perf_counter()
+        current_query = query
+        rewritten_query: str | None = None
+        retries = 0
+        final_context: list[Document] = []
+
+        for attempt in range(self.params.max_retries + 1):
+            final_context = self._retrieve_and_rerank(current_query, metrics)
+            metrics.final_docs = len(final_context)
+            relevant = self._context_is_relevant(current_query, final_context, metrics)
+            metrics.accepted_context = relevant
+            if relevant or attempt >= self.params.max_retries:
+                break
+
+            if not self.params.enable_query_rewrite:
+                break
+
+            rewrite_start = time.perf_counter()
+            current_query = self._rewrite_query(query)
+            metrics.rewrite_ms += _elapsed_ms(rewrite_start)
+            metrics.rewrite_triggered = True
+            rewritten_query = current_query
+            retries += 1
+
+        generation_start = time.perf_counter()
+        answer = self._generate(query, final_context)
+        metrics.generation_ms = _elapsed_ms(generation_start)
+        metrics.total_ms = _elapsed_ms(total_start)
+        metrics.no_answer_detected = _looks_like_no_answer(answer)
+
         return RAGResult(
-            answer=output["response"],
-            sources=serialize_sources(output["context"]),
+            answer=answer,
+            sources=serialize_sources(final_context),
             mode="advanced",
-            rewritten_query=output["current_query"],
-            retries=output["retry_count"],
+            provider=self.provider,
+            model=self.model,
+            metrics=asdict(metrics),
+            params=asdict(self.params),
+            rewritten_query=rewritten_query or current_query,
+            retries=retries,
         )
 
 
@@ -450,7 +572,7 @@ class RAGService:
         self.settings = settings
         self._lock = Lock()
         self._embeddings: HuggingFaceEmbeddings | None = None
-        self._llm: Any | None = None
+        self._llms: dict[tuple[str, str, float], Any] = {}
         self._reranker: CrossEncoder | None = None
         self._index_ready = False
 
@@ -474,24 +596,32 @@ class RAGService:
                 )
             return self._embeddings
 
-    @property
-    def llm(self) -> Any:
+    def _llm_for(self, provider: str, temperature: float) -> Any:
+        provider = provider.strip().lower()
+        model = self.settings.groq_model if provider == "groq" else self.settings.gemini_model
+        key = (provider, model, round(float(temperature), 3))
         with self._lock:
-            if self._llm is None:
-                if self.settings.llm_provider == "groq":
-                    self._llm = GroqChatModel(
+            if key not in self._llms:
+                if provider == "groq":
+                    self._llms[key] = GroqChatModel(
                         api_key=self.settings.groq_api_key or "",
-                        model=self.settings.groq_model,
+                        model=model,
                         base_url=self.settings.groq_base_url,
-                        temperature=0,
+                        temperature=temperature,
                     )
                 else:
-                    self._llm = ChatGoogleGenerativeAI(
-                        model=self.settings.gemini_model,
-                        temperature=0,
+                    self._llms[key] = ChatGoogleGenerativeAI(
+                        model=model,
+                        temperature=temperature,
                         google_api_key=self.settings.google_api_key,
                     )
-            return self._llm
+            return self._llms[key]
+
+    def _provider_model(self, provider: str) -> tuple[str, str]:
+        provider = provider.strip().lower()
+        if provider == "groq":
+            return provider, self.settings.groq_model
+        return "gemini", self.settings.gemini_model
 
     @property
     def reranker(self) -> CrossEncoder:
@@ -513,6 +643,7 @@ class RAGService:
         namespace: str | None = None,
         chunk_size: int = 800,
         chunk_overlap: int = 100,
+        source_name: str | None = None,
     ) -> IngestResult:
         if chunk_size < 1:
             raise ValueError("chunk_size must be at least 1.")
@@ -522,7 +653,7 @@ class RAGService:
             raise ValueError("chunk_overlap must be smaller than chunk_size.")
 
         self._prepare()
-        documents, page_count = extract_pdf_documents(pdf_path)
+        documents, page_count = extract_pdf_documents(pdf_path, source_name)
         if not documents:
             raise ValueError("No extractable text was found in the PDF.")
 
@@ -545,17 +676,97 @@ class RAGService:
         query: str,
         mode: Literal["advanced", "standard"] = "advanced",
         namespace: str | None = None,
+        params: RAGParams | None = None,
     ) -> RAGResult:
         if not query.strip():
             raise ValueError("Query cannot be empty.")
 
+        params = _validate_params(params or RAGParams(max_retries=self.settings.max_retries))
         self._prepare()
         vector_store = self._vector_store(namespace)
+        return self._ask_with_fallback(query.strip(), mode, vector_store, params)
+
+    def _ask_with_fallback(
+        self,
+        query: str,
+        mode: Literal["advanced", "standard"],
+        vector_store: PineconeVectorStore,
+        params: RAGParams,
+    ) -> RAGResult:
+        provider = self.settings.llm_provider
+        try:
+            return self._ask_with_provider(query, mode, vector_store, params, provider)
+        except Exception as exc:
+            fallback_provider = self._fallback_provider(provider)
+            if not params.use_fallback or not fallback_provider or not _is_rate_limit_error(exc):
+                raise
+
+            result = self._ask_with_provider(
+                query, mode, vector_store, params, fallback_provider
+            )
+            result.metrics["fallback_used"] = True
+            result.metrics["fallback_reason"] = str(exc)
+            return result
+
+    def _ask_with_provider(
+        self,
+        query: str,
+        mode: Literal["advanced", "standard"],
+        vector_store: PineconeVectorStore,
+        params: RAGParams,
+        provider: str,
+    ) -> RAGResult:
+        provider, model = self._provider_model(provider)
+        llm = self._llm_for(provider, params.temperature)
         if mode == "standard":
-            return StandardRAG(self.llm, vector_store).ask(query.strip())
+            return StandardRAG(llm, vector_store, params, provider, model).ask(query)
         return AdvancedRAG(
-            self.llm,
+            llm,
             self.reranker,
             vector_store,
-            self.settings.max_retries,
-        ).ask(query.strip())
+            params,
+            provider,
+            model,
+        ).ask(query)
+
+    def _fallback_provider(self, provider: str) -> str | None:
+        if provider == "groq" and self.settings.google_api_key:
+            return "gemini"
+        if provider == "gemini" and self.settings.groq_api_key:
+            return "groq"
+        return None
+
+    def list_namespaces(self) -> list[dict[str, Any]]:
+        self._prepare()
+        index = Pinecone(api_key=self.settings.pinecone_api_key).Index(
+            self.settings.pinecone_index_name
+        )
+        stats = index.describe_index_stats()
+        namespaces = _index_value(stats, "namespaces") or {}
+        items = []
+        for name, detail in namespaces.items():
+            vector_count = None
+            if isinstance(detail, dict):
+                vector_count = detail.get("vector_count")
+            else:
+                vector_count = getattr(detail, "vector_count", None)
+            items.append(
+                {
+                    "namespace": name or "default",
+                    "raw_namespace": name,
+                    "vector_count": vector_count or 0,
+                }
+            )
+        return sorted(items, key=lambda item: item["namespace"])
+
+    def delete_namespace(self, namespace: str | None) -> None:
+        self._prepare()
+        index = Pinecone(api_key=self.settings.pinecone_api_key).Index(
+            self.settings.pinecone_index_name
+        )
+        index.delete(delete_all=True, namespace=namespace or None)
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate limit" in text or "quota" in text

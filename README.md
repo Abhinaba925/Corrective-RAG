@@ -8,16 +8,25 @@ Standard RAG or Advanced Corrective RAG.
 
 - Upload a PDF and index its chunks in Pinecone.
 - Ask questions against the indexed document set.
+- Compare Standard RAG and Advanced CRAG side by side.
+- Run a small batch evaluation set and download CSV metrics.
+- Inspect performance timings for retrieval, reranking, grading, rewriting, and
+  generation.
+- Tune retrieval depth, chunking, retry count, reranking, query rewriting,
+  temperature, and relevance thresholds from the sidebar.
+- List and delete Pinecone namespaces from the app.
 - Choose between:
   - **Advanced CRAG**: rewrite the query, retrieve broadly, rerank context,
     grade relevance, retry when needed, then answer.
   - **Standard RAG**: retrieve context and generate an answer.
+- Fall back to the alternate provider when the active provider rate-limits and
+  the alternate API key is configured.
 - Deploy directly on Streamlit Community Cloud from GitHub.
 
 ## Stack
 
 - **UI**: Streamlit
-- **Workflow**: LangGraph
+- **Pipeline**: Standard RAG and corrective RAG service logic
 - **LLM**: Groq-hosted Qwen by default, or Google Gemini
 - **Vector DB**: Pinecone Serverless
 - **Embeddings**: `BAAI/bge-base-en-v1.5`
@@ -60,6 +69,7 @@ EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
 EMBEDDING_DIMENSION = "768"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 MAX_RETRIES = "2"
+APP_PASSWORD = ""
 ```
 
 The default embedding model uses 768-dimensional vectors, so keep
@@ -68,6 +78,9 @@ creates the Pinecone index automatically if it does not exist.
 
 Set `LLM_PROVIDER = "groq"` to use Groq. Set `LLM_PROVIDER = "gemini"` to use
 Gemini again.
+
+Set `APP_PASSWORD` only if you want the public Streamlit app to require a
+password before use.
 
 ## Run Locally With Streamlit
 
@@ -92,6 +105,17 @@ streamlit run streamlit_app.py
 ```
 
 Do not commit `.env` or `.streamlit/secrets.toml`.
+
+## Streamlit Tabs
+
+- **Ask**: Run one question through Standard RAG or CRAG.
+- **Compare**: Run the same question through both pipelines and compare latency,
+  source counts, reranker scores, retry count, and no-answer detection.
+- **Evaluate**: Paste one question per line, run both pipelines, and download a
+  CSV summary.
+- **Manage**: Refresh Pinecone namespace stats and delete a namespace after
+  typing its exact name.
+- **History**: Review the latest answers and metrics from the current session.
 
 ## Deploy To Streamlit Community Cloud
 

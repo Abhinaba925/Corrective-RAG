@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
-from app.rag import RAGService
+from app.rag import RAGParams, RAGService
 
 
 settings = get_settings()
@@ -31,14 +31,27 @@ class QueryRequest(BaseModel):
     query: str = Field(min_length=1)
     mode: Literal["advanced", "standard"] = "advanced"
     namespace: str | None = None
+    standard_top_k: int = 15
+    advanced_broad_k: int = 40
+    advanced_final_k: int = 5
+    max_retries: int | None = None
+    temperature: float = 0
+    relevance_threshold: float | None = None
+    enable_reranking: bool = True
+    enable_query_rewrite: bool = True
+    use_fallback: bool = True
 
 
 class QueryResponse(BaseModel):
     answer: str
     mode: str
+    provider: str
+    model: str
     rewritten_query: str | None
     retries: int
     sources: list[dict]
+    metrics: dict
+    params: dict
 
 
 class HealthResponse(BaseModel):
@@ -127,13 +140,32 @@ async def query(request: QueryRequest) -> QueryResponse:
             request.query,
             request.mode,
             _namespace(request.namespace),
+            RAGParams(
+                standard_top_k=request.standard_top_k,
+                advanced_broad_k=request.advanced_broad_k,
+                advanced_final_k=request.advanced_final_k,
+                max_retries=(
+                    request.max_retries
+                    if request.max_retries is not None
+                    else settings.max_retries
+                ),
+                temperature=request.temperature,
+                relevance_threshold=request.relevance_threshold,
+                enable_reranking=request.enable_reranking,
+                enable_query_rewrite=request.enable_query_rewrite,
+                use_fallback=request.use_fallback,
+            ),
         )
         return QueryResponse(
             answer=result.answer,
             mode=result.mode,
+            provider=result.provider,
+            model=result.model,
             rewritten_query=result.rewritten_query,
             retries=result.retries,
             sources=result.sources,
+            metrics=result.metrics,
+            params=result.params,
         )
     except (RuntimeError, ValueError, TimeoutError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
