@@ -42,9 +42,6 @@ streamlit_app.py     Streamlit Cloud entry point
 app/
   config.py          Environment configuration
   rag.py             RAG and CRAG pipeline logic
-  main.py            Optional FastAPI entry point
-  static/            Optional FastAPI browser UI
-Corrective_RAG.ipynb Original notebook
 requirements.txt     Python dependencies
 .env.example         Local environment template
 .streamlit/
@@ -143,25 +140,9 @@ the full corrective loop and have enough model quota.
 The first ingestion or Advanced CRAG query can take longer because Hugging Face
 models are downloaded on demand.
 
-## Optional FastAPI/Docker Run
-
-The repo still includes the FastAPI entry point for container-based hosting:
-
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
-```
-
-Docker:
-
-```bash
-docker build -t corrective-rag .
-docker run --env-file .env -p 8080:8080 corrective-rag
-```
-
 ## Notes
 
 - Pinecone namespaces let you keep separate document collections in the same
   index. Leave namespace blank to use the default namespace.
 - Uploaded PDFs are parsed, embedded, sent to Pinecone, and then removed from
   the app runtime.
-- The notebook is still included for reference; deploy `streamlit_app.py`.

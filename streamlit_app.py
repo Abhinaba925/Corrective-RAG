@@ -376,16 +376,6 @@ service = get_service(SERVICE_CACHE_VERSION)
 if "history" not in st.session_state:
     st.session_state.history = []
 
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1.7rem; max-width: 1220px; }
-      [data-testid="stMetricValue"] { font-size: 1.15rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 st.title("Corrective RAG")
 
 app_password = os.getenv("APP_PASSWORD")
