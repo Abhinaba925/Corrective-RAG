@@ -29,6 +29,15 @@ class GradeDocuments(BaseModel):
     )
 
 
+class JudgeComparison(BaseModel):
+    """LLM-as-judge comparison between Standard RAG and CRAG answers."""
+
+    winner: str = Field(description="'standard', 'advanced', or 'tie'")
+    standard_score: int = Field(description="Standard RAG score from 1 to 10")
+    advanced_score: int = Field(description="Advanced CRAG score from 1 to 10")
+    rationale: str = Field(description="Brief reason for the judgement")
+
+
 @dataclass
 class RAGParams:
     standard_top_k: int = 15
@@ -39,6 +48,7 @@ class RAGParams:
     relevance_threshold: float | None = None
     enable_reranking: bool = True
     enable_query_rewrite: bool = True
+    enable_llm_grading: bool = False
     use_fallback: bool = False
 
 
@@ -56,6 +66,7 @@ class QueryMetrics:
     avg_score: float | None = None
     accepted_context: bool = False
     rewrite_triggered: bool = False
+    llm_grading_used: bool = False
     no_answer_detected: bool = False
     fallback_used: bool = False
     fallback_reason: str | None = None
@@ -119,15 +130,13 @@ class GroqChatModel:
             ],
             "temperature": self.temperature,
         }
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=self.timeout,
-        )
+        response = self._post(payload)
+        if response.status_code == 429:
+            retry_after = _retry_after_seconds(response)
+            if retry_after is not None and retry_after <= 20:
+                time.sleep(retry_after + 0.5)
+                response = self._post(payload)
+
         if response.status_code == 429:
             retry_after = response.headers.get("retry-after")
             suffix = f" Retry after {retry_after}s." if retry_after else ""
@@ -141,6 +150,17 @@ class GroqChatModel:
 
     def with_structured_output(self, schema: type[BaseModel]) -> "StructuredGroqChatModel":
         return StructuredGroqChatModel(self, schema)
+
+    def _post(self, payload: dict[str, Any]) -> requests.Response:
+        return requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
 
 
 class StructuredGroqChatModel:
@@ -166,6 +186,9 @@ class StructuredGroqChatModel:
                 except (json.JSONDecodeError, ValidationError):
                     pass
 
+        if "binary_score" not in self.schema.model_fields:
+            raise ValueError(f"Could not parse structured output: {content}")
+
         # The CRAG router only needs a conservative yes/no relevance signal.
         lowered = content.lower()
         if "yes" in lowered and "no" not in lowered:
@@ -175,6 +198,24 @@ class StructuredGroqChatModel:
 
 def _strip_thinking(content: str) -> str:
     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    raw = response.headers.get("retry-after")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    message = json.dumps(data)
+    match = re.search(r"try again in ([0-9.]+)s", message, flags=re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
 
 
 def _require_config(settings: Settings) -> None:
@@ -350,6 +391,30 @@ def _validate_params(params: RAGParams) -> RAGParams:
     return params
 
 
+def answer_word_count(answer: str) -> int:
+    return len(re.findall(r"\b\w+\b", answer))
+
+
+def source_pages(result: RAGResult) -> set[str]:
+    pages = set()
+    for source in result.sources:
+        page = source.get("page")
+        if page is not None:
+            pages.add(str(page))
+    return pages
+
+
+def source_page_overlap(first: RAGResult, second: RAGResult) -> float:
+    first_pages = source_pages(first)
+    second_pages = source_pages(second)
+    if not first_pages and not second_pages:
+        return 0
+    union = first_pages | second_pages
+    if not union:
+        return 0
+    return round(len(first_pages & second_pages) / len(union), 4)
+
+
 class StandardRAG:
     def __init__(
         self,
@@ -477,6 +542,8 @@ class AdvancedRAG:
             and top_score < self.params.relevance_threshold
         ):
             return False
+        if not self.params.enable_llm_grading:
+            return True
 
         context_str = "\n\n".join([doc.page_content for doc in context])
         prompt = (
@@ -487,6 +554,7 @@ class AdvancedRAG:
         grading_start = time.perf_counter()
         grade = self.grader_llm.invoke(prompt)
         metrics.grading_ms += _elapsed_ms(grading_start)
+        metrics.llm_grading_used = True
         return grade.binary_score.strip().lower().startswith("yes")
 
     def _generate(self, original_query: str, context: list[Document]) -> str:
@@ -759,6 +827,48 @@ class RAGService:
             self.settings.pinecone_index_name
         )
         index.delete(delete_all=True, namespace=namespace or None)
+
+    def judge_answers(
+        self,
+        question: str,
+        standard: RAGResult,
+        advanced: RAGResult,
+        temperature: float = 0,
+    ) -> dict[str, Any]:
+        _require_config(self.settings)
+        provider, model = self._provider_model(self.settings.llm_provider)
+        llm = self._llm_for(provider, temperature)
+        judge_llm = llm.with_structured_output(JudgeComparison)
+
+        standard_sources = "\n".join(
+            [
+                f"Page {source.get('page', '?')}: {source.get('preview', '')}"
+                for source in standard.sources[:4]
+            ]
+        )
+        advanced_sources = "\n".join(
+            [
+                f"Page {source.get('page', '?')}: {source.get('preview', '')}"
+                for source in advanced.sources[:4]
+            ]
+        )
+        prompt = (
+            "You are judging two RAG answers for groundedness, completeness, "
+            "faithfulness to sources, and directness. Prefer answers that are "
+            "well-supported by the provided retrieved context. Penalize unsupported "
+            "claims. Return JSON only.\n\n"
+            f"Question:\n{question}\n\n"
+            f"Standard RAG answer:\n{standard.answer}\n\n"
+            f"Standard RAG sources:\n{standard_sources}\n\n"
+            f"Advanced CRAG answer:\n{advanced.answer}\n\n"
+            f"Advanced CRAG sources:\n{advanced_sources}\n\n"
+            "Return winner as 'standard', 'advanced', or 'tie'."
+        )
+        judgement = judge_llm.invoke(prompt)
+        data = judgement.model_dump()
+        data["provider"] = provider
+        data["model"] = model
+        return data
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:

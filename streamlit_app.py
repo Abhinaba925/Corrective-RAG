@@ -11,7 +11,13 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from app.config import Settings
-from app.rag import RAGParams, RAGResult, RAGService
+from app.rag import (
+    RAGParams,
+    RAGResult,
+    RAGService,
+    answer_word_count,
+    source_page_overlap,
+)
 
 
 st.set_page_config(
@@ -75,6 +81,7 @@ def build_params(
     relevance_threshold: float,
     enable_reranking: bool,
     enable_query_rewrite: bool,
+    enable_llm_grading: bool,
     use_fallback: bool,
 ) -> RAGParams:
     return RAGParams(
@@ -86,6 +93,7 @@ def build_params(
         relevance_threshold=relevance_threshold if relevance_threshold_enabled else None,
         enable_reranking=enable_reranking,
         enable_query_rewrite=enable_query_rewrite,
+        enable_llm_grading=enable_llm_grading,
         use_fallback=use_fallback,
     )
 
@@ -152,6 +160,7 @@ def render_result(result: RAGResult, label: str | None = None) -> None:
             st.write(f"Retries: {result.retries}")
             st.write(f"Query rewrite triggered: {result.metrics.get('rewrite_triggered')}")
             st.write(f"Accepted context: {result.metrics.get('accepted_context')}")
+            st.write(f"LLM grading used: {result.metrics.get('llm_grading_used')}")
             st.write(f"No-answer detected: {result.metrics.get('no_answer_detected')}")
 
     with st.expander("Tuning used", expanded=False):
@@ -173,6 +182,8 @@ def comparison_rows(standard: RAGResult, advanced: RAGResult) -> list[dict[str, 
         ("Top score", "top_score"),
         ("Avg score", "avg_score"),
         ("No-answer detected", "no_answer_detected"),
+        ("Fallback used", "fallback_used"),
+        ("LLM grading used", "llm_grading_used"),
     )
     rows = [
         {
@@ -188,6 +199,20 @@ def comparison_rows(standard: RAGResult, advanced: RAGResult) -> list[dict[str, 
             "standard_rag": standard.retries,
             "advanced_crag": advanced.retries,
         }
+    )
+    rows.extend(
+        [
+            {
+                "metric": "Answer words",
+                "standard_rag": answer_word_count(standard.answer),
+                "advanced_crag": answer_word_count(advanced.answer),
+            },
+            {
+                "metric": "Source page overlap",
+                "standard_rag": "-",
+                "advanced_crag": source_page_overlap(standard, advanced),
+            },
+        ]
     )
     return rows
 
@@ -298,6 +323,7 @@ with st.sidebar:
         temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.05)
         enable_reranking = st.checkbox("Rerank CRAG results", value=True)
         enable_query_rewrite = st.checkbox("Rewrite weak queries", value=True)
+        enable_llm_grading = st.checkbox("LLM relevance grading", value=False)
         relevance_threshold_enabled = st.checkbox("Use score threshold", value=False)
         relevance_threshold = st.slider("Score threshold", -10.0, 10.0, 0.0, 0.25)
         use_fallback = st.checkbox("Fallback provider on rate limit", value=False)
@@ -312,6 +338,7 @@ with st.sidebar:
         relevance_threshold=float(relevance_threshold),
         enable_reranking=bool(enable_reranking),
         enable_query_rewrite=bool(enable_query_rewrite),
+        enable_llm_grading=bool(enable_llm_grading),
         use_fallback=bool(use_fallback),
     )
 
@@ -384,6 +411,11 @@ with compare_tab:
         placeholder="Run the same question through Standard RAG and CRAG...",
         key="compare_question",
     )
+    run_compare_judge = st.checkbox(
+        "Run LLM judge",
+        value=False,
+        key="compare_judge",
+    )
     compare_clicked = st.button(
         "Compare RAG vs CRAG",
         type="primary",
@@ -417,6 +449,29 @@ with compare_tab:
                 mime="text/csv",
             )
 
+            if run_compare_judge:
+                try:
+                    with st.spinner("Running LLM judge"):
+                        judgement = service.judge_answers(
+                            compare_question,
+                            standard,
+                            advanced,
+                            temperature=0,
+                        )
+                    st.subheader("LLM judge")
+                    judge_cols = st.columns(4)
+                    judge_cols[0].metric("Winner", judgement.get("winner", "-"))
+                    judge_cols[1].metric(
+                        "Standard", judgement.get("standard_score", "-")
+                    )
+                    judge_cols[2].metric(
+                        "CRAG", judgement.get("advanced_score", "-")
+                    )
+                    judge_cols[3].metric("Judge", judgement.get("model", "-"))
+                    st.write(judgement.get("rationale", ""))
+                except Exception as judge_exc:
+                    st.warning(f"LLM judge failed: {judge_exc}")
+
             left, right = st.columns(2, gap="large")
             with left:
                 render_result(standard, "Standard RAG")
@@ -433,6 +488,11 @@ with evaluate_tab:
         key="eval_questions",
     )
     eval_limit = st.number_input("Limit", min_value=1, max_value=20, value=5)
+    run_eval_judge = st.checkbox(
+        "Run LLM judge for each question",
+        value=False,
+        key="eval_judge",
+    )
     eval_clicked = st.button(
         "Run evaluation",
         type="primary",
@@ -461,6 +521,18 @@ with evaluate_tab:
                         namespace=normalize_namespace(namespace),
                         params=params,
                     )
+                judgement = None
+                if run_eval_judge:
+                    try:
+                        with st.spinner(f"Judging {index} of {len(questions)}"):
+                            judgement = service.judge_answers(
+                                item,
+                                standard,
+                                advanced,
+                                temperature=0,
+                            )
+                    except Exception as judge_exc:
+                        judgement = {"error": str(judge_exc)}
                 rows.append(
                     {
                         "question": item,
@@ -472,6 +544,24 @@ with evaluate_tab:
                         "crag_top_score": advanced.metrics.get("top_score"),
                         "standard_no_answer": standard.metrics.get("no_answer_detected"),
                         "crag_no_answer": advanced.metrics.get("no_answer_detected"),
+                        "source_page_overlap": source_page_overlap(standard, advanced),
+                        "standard_answer_words": answer_word_count(standard.answer),
+                        "crag_answer_words": answer_word_count(advanced.answer),
+                        "judge_winner": (
+                            judgement.get("winner") if judgement else None
+                        ),
+                        "judge_standard_score": (
+                            judgement.get("standard_score") if judgement else None
+                        ),
+                        "judge_crag_score": (
+                            judgement.get("advanced_score") if judgement else None
+                        ),
+                        "judge_rationale": (
+                            judgement.get("rationale")
+                            if judgement
+                            else None
+                        ),
+                        "judge_error": judgement.get("error") if judgement else None,
                         "standard_answer": standard.answer[:240],
                         "crag_answer": advanced.answer[:240],
                     }

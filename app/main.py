@@ -39,7 +39,8 @@ class QueryRequest(BaseModel):
     relevance_threshold: float | None = None
     enable_reranking: bool = True
     enable_query_rewrite: bool = True
-    use_fallback: bool = True
+    enable_llm_grading: bool = False
+    use_fallback: bool = False
 
 
 class QueryResponse(BaseModel):
@@ -153,6 +154,7 @@ async def query(request: QueryRequest) -> QueryResponse:
                 relevance_threshold=request.relevance_threshold,
                 enable_reranking=request.enable_reranking,
                 enable_query_rewrite=request.enable_query_rewrite,
+                enable_llm_grading=request.enable_llm_grading,
                 use_fallback=request.use_fallback,
             ),
         )

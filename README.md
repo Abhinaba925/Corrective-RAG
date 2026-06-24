@@ -10,6 +10,7 @@ Standard RAG or Advanced Corrective RAG.
 - Ask questions against the indexed document set.
 - Compare Standard RAG and Advanced CRAG side by side.
 - Run a small batch evaluation set and download CSV metrics.
+- Optionally run an LLM-as-judge comparison for answer quality.
 - Inspect performance timings for retrieval, reranking, grading, rewriting, and
   generation.
 - Tune retrieval depth, chunking, retry count, reranking, query rewriting,
@@ -110,12 +111,19 @@ Do not commit `.env` or `.streamlit/secrets.toml`.
 
 - **Ask**: Run one question through Standard RAG or CRAG.
 - **Compare**: Run the same question through both pipelines and compare latency,
-  source counts, reranker scores, retry count, and no-answer detection.
+  source counts, reranker scores, answer length, source overlap, retry count,
+  and no-answer detection. The optional LLM judge adds a winner, scores, and a
+  short rationale.
 - **Evaluate**: Paste one question per line, run both pipelines, and download a
-  CSV summary.
+  CSV summary. LLM judging can be enabled, but it uses one extra model call per
+  question.
 - **Manage**: Refresh Pinecone namespace stats and delete a namespace after
   typing its exact name.
 - **History**: Review the latest answers and metrics from the current session.
+
+By default CRAG uses reranker/threshold signals and does not call an LLM grader
+for every retrieval attempt. Enable **LLM relevance grading** only when you want
+the full corrective loop and have enough model quota.
 
 ## Deploy To Streamlit Community Cloud
 
