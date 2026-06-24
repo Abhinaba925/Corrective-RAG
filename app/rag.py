@@ -11,33 +11,14 @@ from threading import Lock
 from typing import Any, Literal
 
 from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.graph import END, START, StateGraph
 from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
 import requests
-from sentence_transformers import CrossEncoder
-from typing_extensions import TypedDict
 
 from app.config import Settings
-
-
-class RAGState(TypedDict):
-    query: str
-    context: list[Document]
-    response: str
-
-
-class AdvancedRAGState(TypedDict):
-    original_query: str
-    current_query: str
-    context: list[Document]
-    response: str
-    retry_count: int
 
 
 class GradeDocuments(BaseModel):
@@ -434,7 +415,7 @@ class AdvancedRAG:
     def __init__(
         self,
         llm: Any,
-        reranker: CrossEncoder,
+        reranker: Any,
         vector_store: PineconeVectorStore,
         params: RAGParams,
         provider: str,
@@ -571,9 +552,9 @@ class RAGService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._lock = Lock()
-        self._embeddings: HuggingFaceEmbeddings | None = None
+        self._embeddings: Any | None = None
         self._llms: dict[tuple[str, str, float], Any] = {}
-        self._reranker: CrossEncoder | None = None
+        self._reranker: Any | None = None
         self._index_ready = False
 
     def _prepare(self) -> None:
@@ -587,9 +568,11 @@ class RAGService:
                 self._index_ready = True
 
     @property
-    def embeddings(self) -> HuggingFaceEmbeddings:
+    def embeddings(self) -> Any:
         with self._lock:
             if self._embeddings is None:
+                from langchain_huggingface import HuggingFaceEmbeddings
+
                 self._embeddings = HuggingFaceEmbeddings(
                     model_name=self.settings.embedding_model,
                     encode_kwargs={"normalize_embeddings": True},
@@ -610,6 +593,8 @@ class RAGService:
                         temperature=temperature,
                     )
                 else:
+                    from langchain_google_genai import ChatGoogleGenerativeAI
+
                     self._llms[key] = ChatGoogleGenerativeAI(
                         model=model,
                         temperature=temperature,
@@ -624,9 +609,11 @@ class RAGService:
         return "gemini", self.settings.gemini_model
 
     @property
-    def reranker(self) -> CrossEncoder:
+    def reranker(self) -> Any:
         with self._lock:
             if self._reranker is None:
+                from sentence_transformers import CrossEncoder
+
                 self._reranker = CrossEncoder(self.settings.reranker_model)
             return self._reranker
 
