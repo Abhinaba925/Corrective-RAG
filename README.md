@@ -24,7 +24,7 @@ score answer quality.
 - [Retrieval And Generation Pipelines](#retrieval-and-generation-pipelines)
 - [Evaluation Metrics](#evaluation-metrics)
 - [LLM-As-A-Judge](#llm-as-a-judge)
-- [LangGraph Status](#langgraph-status)
+- [LangGraph Implementation](#langgraph-implementation)
 - [Important Code Functions](#important-code-functions)
 - [How To Interpret Whether CRAG Is Better](#how-to-interpret-whether-crag-is-better)
 - [Tuning Guide](#tuning-guide)
@@ -134,13 +134,14 @@ flowchart LR
     UI --> Q["Question"]
     Q --> SVC["RAGService"]
     SVC --> STD["StandardRAG"]
-    SVC --> ADV["AdvancedRAG / CRAG"]
+    SVC --> ADV["AdvancedRAG LangGraph"]
 
     STD --> RET1["Retrieve top-k"]
     RET1 --> PC
     RET1 --> GEN1["Generate answer"]
 
-    ADV --> RET2["Broad retrieve"]
+    ADV --> GRAPH["StateGraph control flow"]
+    GRAPH --> RET2["Broad retrieve"]
     RET2 --> PC
     RET2 --> RR["Cross-encoder rerank"]
     RR --> GATE["Relevance gate"]
@@ -161,6 +162,8 @@ Runtime components:
   dataclass.
 - `app/rag.py`: ingestion, Pinecone index setup, Standard RAG, Advanced CRAG,
   provider adapters, metrics, and LLM judge.
+- LangGraph: graph runtime for the Advanced CRAG retrieval, grading, rewrite,
+  and generation control flow.
 - Pinecone: vector database for chunk embeddings.
 - HuggingFace embeddings: default `BAAI/bge-base-en-v1.5`.
 - Cross-encoder reranker: default `cross-encoder/ms-marco-MiniLM-L-6-v2`.
@@ -532,60 +535,99 @@ bad retrieval. Whatever comes back from Pinecone becomes the context.
 
 ```mermaid
 flowchart TD
-    A["Question"] --> B["Use current query"]
-    B --> C["Retrieve advanced_broad_k chunks"]
-    C --> D{"Reranking enabled?"}
-    D -->|"yes"| E["Cross-encoder scores candidates"]
-    D -->|"no"| F["Keep retriever order"]
-    E --> G["Keep advanced_final_k chunks"]
-    F --> G
-    G --> H["Relevance gate"]
-    H -->|"accepted"| I["Generate final answer"]
-    H -->|"weak + retries remain"| J["Rewrite query"]
-    J --> C
-    H -->|"weak + no retries"| I
-    I --> K["Return answer, sources, metrics"]
+    A["Question"] --> B["LangGraph StateGraph"]
+    B --> C["retrieve_and_rerank node"]
+    C --> D["grade_context node"]
+    D --> E{"Route after grading"}
+    E -->|"accepted context"| F["generate_answer node"]
+    E -->|"weak context + retries left"| G["rewrite_query node"]
+    G --> C
+    E -->|"retry limit or rewrite disabled"| F
+    F --> H["Return answer, sources, metrics"]
 ```
 
-`AdvancedRAG.ask()` contains the corrective loop:
+`AdvancedRAG` now implements the corrective loop with LangGraph. The graph state
+is represented by `CRAGState` in `app/rag.py`:
 
 ```python
-def ask(self, query: str) -> RAGResult:
-    metrics = QueryMetrics()
-    total_start = time.perf_counter()
-    current_query = query
-    rewritten_query: str | None = None
-    retries = 0
-    final_context: list[Document] = []
+class CRAGState(TypedDict, total=False):
+    original_query: str
+    current_query: str
+    metrics: QueryMetrics
+    final_context: list[Document]
+    accepted_context: bool
+    rewritten_query: str | None
+    retries: int
+    attempt: int
+    answer: str
+```
 
-    for attempt in range(self.params.max_retries + 1):
-        final_context = self._retrieve_and_rerank(current_query, metrics)
-        metrics.final_docs = len(final_context)
-        relevant = self._context_is_relevant(current_query, final_context, metrics)
-        metrics.accepted_context = relevant
-        if relevant or attempt >= self.params.max_retries:
-            break
+The graph is built in `AdvancedRAG._build_graph()`:
 
-        if not self.params.enable_query_rewrite:
-            break
+```python
+def _build_graph(self) -> Any:
+    try:
+        from langgraph.graph import END, StateGraph
+    except ImportError as exc:
+        raise RuntimeError(
+            "LangGraph is required for Advanced CRAG. "
+            "Install dependencies with `pip install -r requirements.txt`."
+        ) from exc
 
-        rewrite_start = time.perf_counter()
-        current_query = self._rewrite_query(query)
-        metrics.rewrite_ms += _elapsed_ms(rewrite_start)
-        metrics.rewrite_triggered = True
-        rewritten_query = current_query
-        retries += 1
+    workflow = StateGraph(CRAGState)
+    workflow.add_node("retrieve_and_rerank", self._graph_retrieve_and_rerank)
+    workflow.add_node("grade_context", self._graph_grade_context)
+    workflow.add_node("rewrite_query", self._graph_rewrite_query)
+    workflow.add_node("generate_answer", self._graph_generate_answer)
+
+    workflow.set_entry_point("retrieve_and_rerank")
+    workflow.add_edge("retrieve_and_rerank", "grade_context")
+    workflow.add_conditional_edges(
+        "grade_context",
+        self._graph_route_after_grading,
+        {
+            "rewrite_query": "rewrite_query",
+            "generate_answer": "generate_answer",
+        },
+    )
+    workflow.add_edge("rewrite_query", "retrieve_and_rerank")
+    workflow.add_edge("generate_answer", END)
+    return workflow.compile()
+```
+
+`AdvancedRAG.ask()` initializes the state and invokes the compiled graph:
+
+```python
+final_state = self.graph.invoke(
+    {
+        "original_query": query,
+        "current_query": query,
+        "metrics": metrics,
+        "final_context": [],
+        "accepted_context": False,
+        "rewritten_query": None,
+        "retries": 0,
+        "attempt": 0,
+        "answer": "",
+    }
+)
 ```
 
 Important behavior:
 
+- The graph starts at `retrieve_and_rerank`.
+- The graph always routes from retrieval to `grade_context`.
+- The route after grading is conditional.
+- If context is accepted, the graph goes to `generate_answer`.
+- If context is weak, retries remain, and query rewriting is enabled, the graph
+  goes to `rewrite_query`, then loops back to `retrieve_and_rerank`.
+- If the retry limit is reached or rewriting is disabled, the graph goes to
+  `generate_answer`.
 - The app retrieves broadly using `advanced_broad_k`.
 - It optionally reranks using a cross-encoder.
 - It keeps only `advanced_final_k` chunks for generation.
 - It accepts or rejects the context using score threshold and optional LLM
   relevance grading.
-- If context is weak and retry budget remains, it rewrites the original query
-  and retrieves again.
 - It always generates an answer at the end, even if context is weak, but the
   prompt tells the LLM to say so if the answer is unknown.
 
@@ -957,54 +999,268 @@ Ways to make judge results more trustworthy:
 - Track disagreement cases where the judge prefers an answer but sources do not
   support it.
 
-## LangGraph Status
+## LangGraph Implementation
 
-This repository does not currently use LangGraph.
+The Advanced CRAG path uses LangGraph as the runtime controller for the
+corrective retrieval loop.
 
-There is no `langgraph` dependency in `requirements.txt`, and the code does not
-import `StateGraph`, `END`, or other LangGraph primitives. The CRAG control flow
-is implemented directly in Python inside `AdvancedRAG.ask()`.
-
-That was a deliberate simplification for the Streamlit-only version:
-
-- Fewer dependencies for Streamlit Community Cloud.
-- Easier debugging from the app logs.
-- Lower risk of deployment issues.
-- The CRAG loop is small enough to read directly.
-
-Conceptually, the CRAG flow maps cleanly to LangGraph nodes:
-
-| Current function | LangGraph-style node |
-| --- | --- |
-| `RAGService.ask()` | Entry node |
-| `AdvancedRAG._retrieve_and_rerank()` | Retrieve/rerank node |
-| `AdvancedRAG._context_is_relevant()` | Grade/route node |
-| `AdvancedRAG._rewrite_query()` | Rewrite node |
-| `AdvancedRAG._generate()` | Generate node |
-
-The current loop:
-
-```python
-for attempt in range(self.params.max_retries + 1):
-    final_context = self._retrieve_and_rerank(current_query, metrics)
-    relevant = self._context_is_relevant(current_query, final_context, metrics)
-    if relevant or attempt >= self.params.max_retries:
-        break
-    current_query = self._rewrite_query(query)
-```
-
-would become a graph like:
+The dependency is declared in `requirements.txt`:
 
 ```text
-retrieve_and_rerank -> grade_context
-grade_context accepted -> generate
-grade_context rejected -> rewrite_query
-rewrite_query -> retrieve_and_rerank
-retry_limit_reached -> generate
+langgraph==0.2.60
 ```
 
-If LangGraph is added later, the runtime behavior should stay the same unless
-you intentionally change the routing logic.
+LangGraph is used only for the Advanced CRAG pipeline. Standard RAG remains a
+straight retrieval-generation path because it does not need graph routing.
+
+### Why LangGraph Here?
+
+CRAG naturally behaves like a graph:
+
+- Retrieve documents.
+- Grade the retrieved context.
+- If context is good, generate an answer.
+- If context is weak, rewrite the query and retrieve again.
+- Stop when context is accepted or the retry limit is reached.
+
+That control flow is easier to reason about as named graph nodes and explicit
+edges than as a hidden loop inside one large function.
+
+### Graph State
+
+The graph carries a typed state object called `CRAGState`.
+
+```python
+class CRAGState(TypedDict, total=False):
+    original_query: str
+    current_query: str
+    metrics: QueryMetrics
+    final_context: list[Document]
+    accepted_context: bool
+    rewritten_query: str | None
+    retries: int
+    attempt: int
+    answer: str
+```
+
+State field meanings:
+
+| Field | Purpose |
+| --- | --- |
+| `original_query` | The user's unchanged question |
+| `current_query` | The query currently being used for retrieval |
+| `metrics` | Mutable `QueryMetrics` object accumulating timings and flags |
+| `final_context` | Current selected documents after retrieval and reranking |
+| `accepted_context` | Boolean relevance gate result |
+| `rewritten_query` | Last rewritten query, if query rewriting happened |
+| `retries` | Number of rewrite/retry cycles used |
+| `attempt` | Current graph retry attempt counter |
+| `answer` | Final generated answer |
+
+### Graph Nodes
+
+The graph is built in `AdvancedRAG._build_graph()`:
+
+```python
+workflow = StateGraph(CRAGState)
+workflow.add_node("retrieve_and_rerank", self._graph_retrieve_and_rerank)
+workflow.add_node("grade_context", self._graph_grade_context)
+workflow.add_node("rewrite_query", self._graph_rewrite_query)
+workflow.add_node("generate_answer", self._graph_generate_answer)
+```
+
+The node responsibilities are:
+
+| Node | Function | Responsibility |
+| --- | --- | --- |
+| `retrieve_and_rerank` | `_graph_retrieve_and_rerank()` | Retrieve broad candidates, optionally rerank, keep final docs |
+| `grade_context` | `_graph_grade_context()` | Decide whether retrieved context is relevant enough |
+| `rewrite_query` | `_graph_rewrite_query()` | Rewrite the original question for better vector search |
+| `generate_answer` | `_graph_generate_answer()` | Generate the final context-grounded answer |
+
+### Graph Edges
+
+The fixed edges are:
+
+```python
+workflow.set_entry_point("retrieve_and_rerank")
+workflow.add_edge("retrieve_and_rerank", "grade_context")
+workflow.add_edge("rewrite_query", "retrieve_and_rerank")
+workflow.add_edge("generate_answer", END)
+```
+
+This means:
+
+- Every graph run starts with retrieval.
+- Every retrieval is followed by grading.
+- Every rewrite loops back into retrieval.
+- Generation is the terminal node.
+
+### Conditional Routing
+
+The important decision happens after `grade_context`.
+
+```python
+workflow.add_conditional_edges(
+    "grade_context",
+    self._graph_route_after_grading,
+    {
+        "rewrite_query": "rewrite_query",
+        "generate_answer": "generate_answer",
+    },
+)
+```
+
+The router function is:
+
+```python
+def _graph_route_after_grading(self, state: CRAGState) -> str:
+    if state.get("accepted_context"):
+        return "generate_answer"
+    if state.get("attempt", 0) >= self.params.max_retries:
+        return "generate_answer"
+    if not self.params.enable_query_rewrite:
+        return "generate_answer"
+    return "rewrite_query"
+```
+
+Routing logic:
+
+- Accepted context goes directly to answer generation.
+- Weak context goes to query rewrite only if retry budget remains.
+- If retries are exhausted, the graph still generates an answer from the best
+  available context.
+- If query rewriting is disabled, the graph does not loop.
+
+### Graph Node Code
+
+The retrieval node:
+
+```python
+def _graph_retrieve_and_rerank(self, state: CRAGState) -> CRAGState:
+    metrics = state["metrics"]
+    final_context = self._retrieve_and_rerank(state["current_query"], metrics)
+    metrics.final_docs = len(final_context)
+    return {
+        "metrics": metrics,
+        "final_context": final_context,
+    }
+```
+
+The grading node:
+
+```python
+def _graph_grade_context(self, state: CRAGState) -> CRAGState:
+    metrics = state["metrics"]
+    relevant = self._context_is_relevant(
+        state["current_query"],
+        state.get("final_context", []),
+        metrics,
+    )
+    metrics.accepted_context = relevant
+    return {
+        "metrics": metrics,
+        "accepted_context": relevant,
+    }
+```
+
+The rewrite node:
+
+```python
+def _graph_rewrite_query(self, state: CRAGState) -> CRAGState:
+    metrics = state["metrics"]
+    rewrite_start = time.perf_counter()
+    rewritten_query = self._rewrite_query(state["original_query"])
+    metrics.rewrite_ms += _elapsed_ms(rewrite_start)
+    metrics.rewrite_triggered = True
+    return {
+        "current_query": rewritten_query,
+        "rewritten_query": rewritten_query,
+        "retries": state.get("retries", 0) + 1,
+        "attempt": state.get("attempt", 0) + 1,
+        "metrics": metrics,
+    }
+```
+
+The generation node:
+
+```python
+def _graph_generate_answer(self, state: CRAGState) -> CRAGState:
+    metrics = state["metrics"]
+    generation_start = time.perf_counter()
+    answer = self._generate(
+        state["original_query"],
+        state.get("final_context", []),
+    )
+    metrics.generation_ms = _elapsed_ms(generation_start)
+    return {
+        "answer": answer,
+        "metrics": metrics,
+    }
+```
+
+### End-To-End Graph Invocation
+
+`AdvancedRAG.ask()` creates the initial state, invokes the compiled graph, then
+turns the final state into a `RAGResult`.
+
+```python
+final_state = self.graph.invoke(
+    {
+        "original_query": query,
+        "current_query": query,
+        "metrics": metrics,
+        "final_context": [],
+        "accepted_context": False,
+        "rewritten_query": None,
+        "retries": 0,
+        "attempt": 0,
+        "answer": "",
+    }
+)
+```
+
+After the graph returns, `AdvancedRAG.ask()` extracts:
+
+- `metrics`
+- `answer`
+- `final_context`
+- `rewritten_query`
+- `retries`
+
+and returns the same `RAGResult` shape used by the Streamlit UI.
+
+### Why The UI Did Not Need To Change
+
+The Streamlit app still calls:
+
+```python
+result = service.ask(
+    question,
+    mode=mode,
+    namespace=normalize_namespace(namespace),
+    params=params,
+)
+```
+
+`RAGService._ask_with_provider()` still chooses Standard RAG or Advanced CRAG:
+
+```python
+if mode == "standard":
+    return StandardRAG(llm, vector_store, params, provider, model).ask(query)
+return AdvancedRAG(
+    llm,
+    self.reranker,
+    vector_store,
+    params,
+    provider,
+    model,
+).ask(query)
+```
+
+Because `AdvancedRAG.ask()` still returns `RAGResult`, the UI, comparison tab,
+evaluation tab, history tab, and LLM judge continue to work without interface
+changes.
 
 ## Important Code Functions
 
@@ -1081,6 +1337,81 @@ class RAGResult:
     params: dict[str, Any]
     rewritten_query: str | None = None
     retries: int = 0
+```
+
+### `CRAGState`
+
+Location: `app/rag.py`
+
+Purpose: define the state object passed between LangGraph nodes in the Advanced
+CRAG pipeline.
+
+```python
+class CRAGState(TypedDict, total=False):
+    original_query: str
+    current_query: str
+    metrics: QueryMetrics
+    final_context: list[Document]
+    accepted_context: bool
+    rewritten_query: str | None
+    retries: int
+    attempt: int
+    answer: str
+```
+
+### `AdvancedRAG._build_graph()`
+
+Location: `app/rag.py`
+
+Purpose: create and compile the LangGraph `StateGraph` that controls the CRAG
+retrieve, grade, rewrite, and generate loop.
+
+```python
+def _build_graph(self) -> Any:
+    try:
+        from langgraph.graph import END, StateGraph
+    except ImportError as exc:
+        raise RuntimeError(
+            "LangGraph is required for Advanced CRAG. "
+            "Install dependencies with `pip install -r requirements.txt`."
+        ) from exc
+
+    workflow = StateGraph(CRAGState)
+    workflow.add_node("retrieve_and_rerank", self._graph_retrieve_and_rerank)
+    workflow.add_node("grade_context", self._graph_grade_context)
+    workflow.add_node("rewrite_query", self._graph_rewrite_query)
+    workflow.add_node("generate_answer", self._graph_generate_answer)
+
+    workflow.set_entry_point("retrieve_and_rerank")
+    workflow.add_edge("retrieve_and_rerank", "grade_context")
+    workflow.add_conditional_edges(
+        "grade_context",
+        self._graph_route_after_grading,
+        {
+            "rewrite_query": "rewrite_query",
+            "generate_answer": "generate_answer",
+        },
+    )
+    workflow.add_edge("rewrite_query", "retrieve_and_rerank")
+    workflow.add_edge("generate_answer", END)
+    return workflow.compile()
+```
+
+### `AdvancedRAG._graph_route_after_grading()`
+
+Location: `app/rag.py`
+
+Purpose: choose the next LangGraph node after relevance grading.
+
+```python
+def _graph_route_after_grading(self, state: CRAGState) -> str:
+    if state.get("accepted_context"):
+        return "generate_answer"
+    if state.get("attempt", 0) >= self.params.max_retries:
+        return "generate_answer"
+    if not self.params.enable_query_rewrite:
+        return "generate_answer"
+    return "rewrite_query"
 ```
 
 ### `GroqChatModel`
@@ -1425,7 +1756,7 @@ After editing or testing locally:
 
 ```bash
 git add -A
-git commit -m "Document CRAG architecture and evaluation"
+git commit -m "Document LangGraph CRAG implementation"
 git pull --rebase origin main
 git push origin main
 ```
