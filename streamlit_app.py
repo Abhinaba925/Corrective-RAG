@@ -20,6 +20,9 @@ from app.rag import (
 )
 
 
+SERVICE_CACHE_VERSION = "rag-service-judge-v2"
+
+
 st.set_page_config(
     page_title="Corrective RAG",
     layout="wide",
@@ -56,7 +59,8 @@ def hydrate_environment_from_streamlit(keys: Iterable[str]) -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def get_service() -> RAGService:
+def get_service(cache_version: str) -> RAGService:
+    del cache_version
     return RAGService(Settings.from_env())
 
 
@@ -237,6 +241,25 @@ def handle_error(exc: Exception) -> None:
         st.error(message)
 
 
+def run_llm_judge(
+    question: str,
+    standard: RAGResult,
+    advanced: RAGResult,
+) -> dict[str, object]:
+    if not hasattr(service, "judge_answers"):
+        get_service.clear()
+        raise RuntimeError(
+            "The app is using an old cached RAG service. Reboot the Streamlit app "
+            "once, then run the judge again."
+        )
+    return service.judge_answers(
+        question,
+        standard,
+        advanced,
+        temperature=0,
+    )
+
+
 def add_history(question: str, result: RAGResult) -> None:
     st.session_state.history.insert(
         0,
@@ -256,7 +279,7 @@ def add_history(question: str, result: RAGResult) -> None:
 load_dotenv()
 hydrate_environment_from_streamlit(SECRET_KEYS)
 settings = Settings.from_env()
-service = get_service()
+service = get_service(SERVICE_CACHE_VERSION)
 
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -452,11 +475,10 @@ with compare_tab:
             if run_compare_judge:
                 try:
                     with st.spinner("Running LLM judge"):
-                        judgement = service.judge_answers(
+                        judgement = run_llm_judge(
                             compare_question,
                             standard,
                             advanced,
-                            temperature=0,
                         )
                     st.subheader("LLM judge")
                     judge_cols = st.columns(4)
@@ -525,11 +547,10 @@ with evaluate_tab:
                 if run_eval_judge:
                     try:
                         with st.spinner(f"Judging {index} of {len(questions)}"):
-                            judgement = service.judge_answers(
+                            judgement = run_llm_judge(
                                 item,
                                 standard,
                                 advanced,
-                                temperature=0,
                             )
                     except Exception as judge_exc:
                         judgement = {"error": str(judge_exc)}
